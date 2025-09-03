@@ -7,6 +7,7 @@
 use crate::chain::{Chain, DBInterface, PowChainBackend, ShardBackend, ShardBackendErr};
 use crate::consensus::SECTORS;
 use crate::node::{PeerInfo, PeerInfoTable, NODE_INFO, PEER_INFO_TABLE};
+use crate::settings::SETTINGS;
 use futures::{
     future::{self, Ready},
     prelude::*,
@@ -30,16 +31,65 @@ pub type RpcRequest = tarpc::ClientMessage<RpcServerDefinitionRequest>;
 pub type RpcResponse = tarpc::Response<RpcServerDefinitionResponse>;
 pub type RpcChannel = tarpc::transport::channel::UnboundedChannel<RpcResponse, RpcRequest>;
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BlockchainInfo {
+    pub network: String,
+    pub version: String,
+    pub protocol_version: u32,
+    pub sectors: SectorInfo,
+    pub shards: ShardInfo,
+    pub mempool: MempoolSummary,
+    pub node: NodeSummary,
+    pub uptime: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SectorInfo {
+    pub total_sectors: u8,
+    pub active_sectors: u8,
+    pub sector_heights: HashMap<u8, u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ShardInfo {
+    pub total_shards: u16,
+    pub active_shards: u16,
+    pub shard_heights: HashMap<u8, u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MempoolSummary {
+    pub total_transactions: u32,
+    pub total_size_bytes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NodeSummary {
+    pub peer_count: u64,
+    pub network_active: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BlockStats {
+    pub hash: String,
+    pub height: u64,
+    pub timestamp: i64,
+    pub transaction_count: u32,
+    pub block_size_bytes: u64,
+    pub total_fees: u64,
+    pub shard_id: u8,
+}
+
 #[tarpc::service]
 pub trait RpcServerDefinition {
     /// Returns information about the Blockchain
-    async fn get_blockchain_info() -> String;
+    async fn get_blockchain_info() -> Result<BlockchainInfo, RpcErr>;
 
     /// Returns the hash of block in best-block-chain at height provided
-    async fn get_block_hash(chain_id: u8, height: u64) -> String;
+    async fn get_block_hash(chain_id: u8, height: u64) -> Result<String, RpcErr>;
 
     /// Returns block stats for block with the given hash
-    async fn get_block_stats(hash: String) -> String;
+    async fn get_block_stats(hash: String) -> Result<BlockStats, RpcErr>;
 
     /// Returns the height of the most-work fully-validated sector
     async fn get_sector_height(sector_id: u8) -> Result<u64, RpcErr>;
@@ -204,6 +254,9 @@ pub enum RpcErr {
 
     /// Shard error
     ShardBackendErr,
+
+    /// The provided block hash is invalid or block not found
+    InvalidBlockHash,
 }
 
 /// RPC server
@@ -216,8 +269,67 @@ pub struct RpcServer<B: PowChainBackend + ShardBackend + DBInterface + Send + Sy
 impl<B: PowChainBackend + ShardBackend + DBInterface + Send + Sync + 'static> RpcServerDefinition
     for RpcServer<B>
 {
-    async fn get_blockchain_info(self, _: context::Context) -> String {
-        "Hello world!".to_string()
+    async fn get_blockchain_info(self, _: context::Context) -> Result<BlockchainInfo, RpcErr> {
+        // Collect sector information
+        let mut sector_heights = HashMap::new();
+        for (sector_id, sector) in &self.chain.sectors {
+            if let Ok(height) = sector.height() {
+                sector_heights.insert(*sector_id, height);
+            }
+        }
+
+        // Collect shard information
+        let mut shard_heights = HashMap::new();
+        for (shard_id, shard) in &self.chain.chain_states {
+            if let Ok(height) = shard.height() {
+                shard_heights.insert(*shard_id, height);
+            }
+        }
+
+        // Get mempool information
+        let mempool = self.chain.mempool.read();
+        let mempool_summary = MempoolSummary {
+            total_transactions: mempool.transactions.len() as u32,
+            total_size_bytes: mempool
+                .transactions
+                .values()
+                .map(|tx| tx.len())
+                .sum::<usize>() as u64,
+        };
+
+        // Get node information
+        let peer_count = unsafe {
+            PEER_INFO_TABLE
+                .as_ref()
+                .map(|table| table.read().len() as u64)
+                .unwrap_or(0)
+        };
+
+        // Calculate uptime
+        let startup = crate::global::STARTUP_TIME.load(Ordering::Relaxed);
+        let uptime = crate::global::get_unix_timestamp_secs() - startup;
+
+        Ok(BlockchainInfo {
+            network: SETTINGS.node.network_name.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: 1, // TODO: Define actual protocol version
+            sectors: SectorInfo {
+                total_sectors: SECTORS as u8,
+                active_sectors: self.chain.sectors.len() as u8,
+                sector_heights,
+            },
+            shards: ShardInfo {
+                total_shards: 256,
+                active_shards: self.chain.chain_states.len() as u16,
+                shard_heights,
+            },
+            mempool: mempool_summary,
+            node: NodeSummary {
+                peer_count,
+                network_active: true, // TODO: Get actual network status
+            },
+            uptime,
+        })
     }
 
     async fn get_mempool_info(self, _: context::Context) -> String {
@@ -258,12 +370,91 @@ impl<B: PowChainBackend + ShardBackend + DBInterface + Send + Sync + 'static> Rp
         "Hello world!".to_string()
     }
 
-    async fn get_block_hash(self, _: context::Context, chain_id: u8, height: u64) -> String {
-        "Hello world!".to_string()
+    async fn get_block_hash(
+        self,
+        _: context::Context,
+        chain_id: u8,
+        height: u64,
+    ) -> Result<String, RpcErr> {
+        // Get the shard for this chain_id
+        let shard = self
+            .chain
+            .chain_states
+            .get(&chain_id)
+            .ok_or(RpcErr::ShardNotInitialised)?;
+
+        // Get the canonical block header at the specified height
+        match shard.get_canonical_block_at_height(height) {
+            Ok(Some(block_header)) => Ok(block_header.hash().to_hex()),
+            Ok(None) => {
+                // No block at this height
+                Err(RpcErr::ShardBackendErr)
+            }
+            Err(_) => Err(RpcErr::ShardBackendErr),
+        }
     }
 
-    async fn get_block_stats(self, _: context::Context, hash: String) -> String {
-        "Hello world!".to_string()
+    async fn get_block_stats(
+        self,
+        _: context::Context,
+        hash: String,
+    ) -> Result<BlockStats, RpcErr> {
+        // Parse the hex hash
+        let hash_bytes = hex::decode(&hash).map_err(|_| RpcErr::InvalidBlockHash)?;
+        if hash_bytes.len() != 32 {
+            return Err(RpcErr::InvalidBlockHash);
+        }
+
+        let mut hash_array = [0u8; 32];
+        hash_array.copy_from_slice(&hash_bytes);
+        let target_hash = crate::primitives::Hash256(hash_array);
+
+        // Search through all active shards to find the block
+        for (shard_id, shard) in &self.chain.chain_states {
+            // Try to get the canonical block with this hash
+            match shard.get_canonical_block(&target_hash) {
+                Ok(Some(block_header)) => {
+                    // Get the block data to calculate stats
+                    let block_data = shard
+                        .get_block_data(&target_hash)
+                        .map_err(|_| RpcErr::ShardBackendErr)?;
+
+                    let (transaction_count, total_fees) = if let Some(data) = block_data {
+                        let tx_count = data.transactions.len() as u32;
+                        let fees = data.transactions.iter().map(|tx| tx.fee).sum::<u64>();
+                        (tx_count, fees)
+                    } else {
+                        (0, 0)
+                    };
+
+                    // Calculate approximate block size
+                    let block_size = crate::codec::encode_to_vec(&block_header)
+                        .map(|encoded| encoded.len() as u64)
+                        .unwrap_or(0);
+
+                    return Ok(BlockStats {
+                        hash: hash.clone(),
+                        height: block_header.pos,
+                        timestamp: block_header.timestamp,
+                        transaction_count,
+                        block_size_bytes: block_size,
+                        total_fees,
+                        shard_id: *shard_id,
+                    });
+                }
+                Ok(None) => {
+                    // Block not found in this shard, continue searching
+                    continue;
+                }
+                Err(_) => {
+                    // Error accessing shard, continue searching other shards
+                    continue;
+                }
+            }
+        }
+
+        // Block not found in any shard
+        Err(RpcErr::InvalidBlockHash)
     }
 
     async fn precious_block(self, _: context::Context, hash: String) -> String {
