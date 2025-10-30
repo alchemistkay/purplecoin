@@ -80,6 +80,12 @@ pub struct BlockStats {
     pub shard_id: u8,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RawMempool {
+    pub transaction_hashes: Vec<String>,
+    pub total_transactions: u32,
+}
+
 #[tarpc::service]
 pub trait RpcServerDefinition {
     /// Returns information about the Blockchain
@@ -101,13 +107,13 @@ pub trait RpcServerDefinition {
     async fn get_shard_info(chain_id: u8) -> String;
 
     /// Returns info about the mempool
-    async fn get_mempool_info() -> String;
+    async fn get_mempool_info() -> Result<MempoolSummary, RpcErr>;
 
     /// Returns the raw mempool data for a shard
-    async fn get_raw_mempool_shard(chain_id: u8) -> String;
+    async fn get_raw_mempool_shard(chain_id: u8) -> Result<RawMempool, RpcErr>;
 
     /// Returns the raw mempool data for all shards
-    async fn get_raw_mempool() -> String;
+    async fn get_raw_mempool() -> Result<RawMempool, RpcErr>;
 
     /// Marks the block with the given hash as precious
     async fn precious_block(block_hash: String) -> String;
@@ -289,12 +295,8 @@ impl<B: PowChainBackend + ShardBackend + DBInterface + Send + Sync + 'static> Rp
         // Get mempool information
         let mempool = self.chain.mempool.read();
         let mempool_summary = MempoolSummary {
-            total_transactions: mempool.transactions.len() as u32,
-            total_size_bytes: mempool
-                .transactions
-                .values()
-                .map(|tx| tx.len())
-                .sum::<usize>() as u64,
+            total_transactions: mempool.tx_map.len() as u32,
+            total_size_bytes: mempool.current_size_bytes,
         };
 
         // Get node information
@@ -332,12 +334,31 @@ impl<B: PowChainBackend + ShardBackend + DBInterface + Send + Sync + 'static> Rp
         })
     }
 
-    async fn get_mempool_info(self, _: context::Context) -> String {
-        "Hello world!".to_string()
+    async fn get_mempool_info(self, _: context::Context) -> Result<MempoolSummary, RpcErr> {
+        // Get mempool information
+        let mempool = self.chain.mempool.read();
+        let mempool_summary = MempoolSummary {
+            total_transactions: mempool.tx_map.len() as u32,
+            total_size_bytes: mempool.current_size_bytes,
+        };
+
+        Ok(mempool_summary)
     }
 
-    async fn get_raw_mempool(self, _: context::Context) -> String {
-        "Hello world!".to_string()
+    async fn get_raw_mempool(self, _: context::Context) -> Result<RawMempool, RpcErr> {
+        // Get all transactions from mempool
+        let mempool = self.chain.mempool.read();
+        let transaction_hashes: Vec<String> = mempool
+            .tx_map
+            .keys()
+            .map(|hash| hash.to_hex())
+            .collect();
+        let total_transactions = transaction_hashes.len() as u32;
+
+        Ok(RawMempool {
+            transaction_hashes,
+            total_transactions,
+        })
     }
 
     async fn get_sector_height(self, _: context::Context, sector_id: u8) -> Result<u64, RpcErr> {
@@ -366,8 +387,25 @@ impl<B: PowChainBackend + ShardBackend + DBInterface + Send + Sync + 'static> Rp
         "Hello world!".to_string()
     }
 
-    async fn get_raw_mempool_shard(self, _: context::Context, chain_id: u8) -> String {
-        "Hello world!".to_string()
+    async fn get_raw_mempool_shard(
+        self,
+        _: context::Context,
+        chain_id: u8,
+    ) -> Result<RawMempool, RpcErr> {
+        // Filter transactions by shard/chain_id
+        let mempool = self.chain.mempool.read();
+        let transaction_hashes: Vec<String> = mempool
+            .tx_map
+            .iter()
+            .filter(|(_, tx)| tx.tx.tx.chain_id == chain_id)
+            .map(|(hash, _)| hash.to_hex())
+            .collect();
+        let total_transactions = transaction_hashes.len() as u32;
+
+        Ok(RawMempool {
+            transaction_hashes,
+            total_transactions,
+        })
     }
 
     async fn get_block_hash(
@@ -384,8 +422,8 @@ impl<B: PowChainBackend + ShardBackend + DBInterface + Send + Sync + 'static> Rp
             .ok_or(RpcErr::ShardNotInitialised)?;
 
         // Get the canonical block header at the specified height
-        match shard.get_canonical_block_at_height(height) {
-            Ok(Some(block_header)) => Ok(block_header.hash().to_hex()),
+        match shard.backend.get_canonical_block_at_height(height) {
+            Ok(Some(block_header)) => Ok(block_header.hash().unwrap().to_hex()),
             Ok(None) => {
                 // No block at this height
                 Err(RpcErr::ShardBackendErr)
@@ -412,16 +450,17 @@ impl<B: PowChainBackend + ShardBackend + DBInterface + Send + Sync + 'static> Rp
         // Search through all active shards to find the block
         for (shard_id, shard) in &self.chain.chain_states {
             // Try to get the canonical block with this hash
-            match shard.get_canonical_block(&target_hash) {
+            match shard.backend.get_canonical_block(&target_hash) {
                 Ok(Some(block_header)) => {
                     // Get the block data to calculate stats
                     let block_data = shard
-                        .get_block_data(&target_hash)
+                        .backend.get_block_data(&target_hash)
                         .map_err(|_| RpcErr::ShardBackendErr)?;
 
                     let (transaction_count, total_fees) = if let Some(data) = block_data {
-                        let tx_count = data.transactions.len() as u32;
-                        let fees = data.transactions.iter().map(|tx| tx.fee).sum::<u64>();
+                        let tx_count = data.txs.len() as u32;
+                        // Note: Transaction fees no longer stored in blocks after protocol update
+                        let fees = 0u64;
                         (tx_count, fees)
                     } else {
                         (0, 0)
@@ -434,8 +473,8 @@ impl<B: PowChainBackend + ShardBackend + DBInterface + Send + Sync + 'static> Rp
 
                     return Ok(BlockStats {
                         hash: hash.clone(),
-                        height: block_header.pos,
-                        timestamp: block_header.timestamp,
+                        height: block_header.height,
+                        timestamp: 0, // Timestamp removed from block headers in protocol update
                         transaction_count,
                         block_size_bytes: block_size,
                         total_fees,
